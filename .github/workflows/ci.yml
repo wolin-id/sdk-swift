@@ -1,0 +1,21 @@
+name: Swift CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    name: Swift Build & Test (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check Swift version
+        run: swift --version
+
+      - name: Build & test WolinKit
+        run: swift test --parallel
