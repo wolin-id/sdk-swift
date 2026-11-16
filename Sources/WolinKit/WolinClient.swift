@@ -1,11 +1,110 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// Copyright (c) 2026 Entropy Paradox, Inc. (https://wolin.id)
+// Copyright (c) 2026 Entropy Paradox, Inc. — Wolin (月印千江) (https://wolin.id)
 
 import Foundation
 @preconcurrency import CryptoKit
 
-/// Actor-safe W3C Solid 0.11 & Solid-OIDC + RFC 9449 DPoP client for the Wolin Solid Pod Engine.
+private final class NoRedirectSessionDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    static let shared = NoRedirectSessionDelegate()
+
+    nonisolated func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest
+    ) async -> URLRequest? {
+        nil
+    }
+}
+
+/// Actor-safe W3C Solid 0.11 & Solid-OIDC + RFC 9449 DPoP client for Wolin (月印千江).
 public actor WolinClient {
+    /// Official Wolin (月印千江) Solid-OIDC Provider & Passport production endpoint.
+    public static let defaultAuthURLString = "https://auth.wolin.id"
+
+    /// Official Wolin (月印千江) Sovereign Solid Pod Engine production endpoint.
+    public static let defaultPodURLString = "https://pod.wolin.id"
+
+    /// Official Wolin (月印千江) Solid-OIDC Provider & Passport production URL.
+    public static let defaultAuthURL = URL(string: defaultAuthURLString)!
+
+    /// Official Wolin (月印千江) Sovereign Solid Pod Engine production URL.
+    public static let defaultPodURL = URL(string: defaultPodURLString)!
+
+    /// Minimum allowed character length for a Wolin `pod_id` handle.
+    public static let minPodIDLength = 3
+
+    /// Maximum allowed character length for a Wolin `pod_id` handle.
+    public static let maxPodIDLength = 32
+
+    /// Canonical reserved system/infrastructure handles blocked by Wolin Cloud & Engine.
+    public static let reservedPodIDs: Set<String> = [
+        "abuse", "admin", "administrator", "ads", "api", "app", "apps", "assets",
+        "auth", "authorize", "autoconfig", "autodiscover", "backup", "beta", "billing", "blog",
+        "calendar", "cdn", "chat", "cloud", "consent", "console", "contact", "control",
+        "corp", "dashboard", "data", "dev", "dns", "doc", "docs", "download",
+        "downloads", "edge", "email", "engine", "enterprise", "entropy", "events", "files",
+        "forum", "ftp", "gateway", "git", "graphql", "health", "healthz", "help",
+        "home", "host", "hostmaster", "id", "idp", "images", "imap", "img",
+        "inbox", "info", "internal", "jwks", "legal", "local", "localhost", "login",
+        "logout", "logs", "mail", "mailer", "manage", "mcp", "media", "metrics",
+        "mta-sts", "mx", "net", "news", "no-reply", "noreply", "notify", "ns",
+        "ns1", "ns2", "ns3", "ns4", "oauth", "official", "oidc", "ops",
+        "org", "origin", "passport", "pay", "payment", "payments", "pod", "pods",
+        "pop", "pop3", "portal", "postmaster", "press", "pricing", "private", "prod",
+        "production", "profile", "proxy", "pub", "public", "register", "registry", "relay",
+        "root", "rpc", "rss", "sandbox", "search", "secure", "security", "server",
+        "service", "services", "session", "settings", "sftp", "signin", "signout", "signup",
+        "smtp", "solid", "sparql", "ssh", "sso", "stage", "staging", "static",
+        "stats", "status", "storage", "store", "support", "sync", "sys", "system",
+        "team", "telemetry", "terms", "test", "testing", "token", "trust", "updates",
+        "upload", "uploads", "userinfo", "vault", "verify", "vpn", "wac", "web",
+        "webhook", "webhooks", "webid", "webmail", "webmaster", "well-known", "wolin", "ws",
+        "wss", "www"
+    ]
+
+    private static let redirectStatusCodes: Set<Int> = [301, 302, 303, 307, 308]
+    private static let maxSafeRedirects = 5
+
+    /// Validates a Wolin `pod_id` handle (`3..32` chars, lowercase ASCII `[a-z0-9-]`,
+    /// starts and ends with `[a-z0-9]`, no consecutive `'--'`, and not reserved).
+    @discardableResult
+    public static func validatePodID(_ podID: String) throws -> String {
+        let count = podID.utf8.count
+        guard count >= minPodIDLength && count <= maxPodIDLength, podID.count == count else {
+            throw WolinError.invalidPodID(
+                "pod_id must be between \(minPodIDLength) and \(maxPodIDLength) lowercase ASCII characters"
+            )
+        }
+        guard !podID.hasPrefix("-"), !podID.hasSuffix("-") else {
+            throw WolinError.invalidPodID(
+                "pod_id must contain only lowercase ASCII [a-z0-9-] and start and end with [a-z0-9]"
+            )
+        }
+        for byte in podID.utf8 {
+            let isLower = byte >= 0x61 && byte <= 0x7A
+            let isDigit = byte >= 0x30 && byte <= 0x39
+            let isHyphen = byte == 0x2D
+            if !isLower && !isDigit && !isHyphen {
+                throw WolinError.invalidPodID(
+                    "pod_id must contain only lowercase ASCII [a-z0-9-] and start and end with [a-z0-9]"
+                )
+            }
+        }
+        if podID.contains("--") {
+            throw WolinError.invalidPodID("pod_id must not contain consecutive hyphens ('--')")
+        }
+        if reservedPodIDs.contains(podID) {
+            throw WolinError.invalidPodID("pod_id '\(podID)' is reserved for system infrastructure")
+        }
+        return podID
+    }
+
+    /// Returns `true` if `podID` satisfies all Wolin `pod_id` syntax and reservation rules.
+    public static func isValidPodID(_ podID: String) -> Bool {
+        (try? validatePodID(podID)) != nil
+    }
+
     /// Immutable ES256 DPoP signer bound to this client session.
     public let dpopSigner: DPoPSigner
 
@@ -100,11 +199,10 @@ public actor WolinClient {
             throw WolinError.invalidURL(rawWebID)
         }
 
-        let (data, response) = try await performRequest(
+        let (data, response, _) = try await performSafeReadRequest(
             method: "GET",
             url: docURL,
             headers: ["Accept": "text/turtle, application/x-turtle;q=0.9"],
-            body: nil,
             etagMatch: .any,
             attachAuth: authenticated
         )
@@ -181,6 +279,7 @@ public actor WolinClient {
     // MARK: - Solid LDP CRUD Operations
 
     /// Retrieves a Solid Pod LDP resource via `GET`, including `ETag`, `Link` metadata, and payload bytes.
+    /// Safely follows `302 Found` signed asset offload redirects without leaking `Authorization` or `DPoP` headers across origins.
     public func getResource(
         at url: URL,
         accept: String? = nil,
@@ -190,19 +289,20 @@ public actor WolinClient {
         if let accept {
             headers["Accept"] = accept
         }
-        let (data, response) = try await performRequest(
+        let (data, response, fallbackResponse) = try await performSafeReadRequest(
             method: "GET",
             url: url,
             headers: headers,
-            body: nil,
             etagMatch: etagMatch,
             attachAuth: true
         )
         if response.statusCode == 304 {
-            throw WolinError.notModified(etag: response.value(forHTTPHeaderField: "ETag"))
+            let etag = response.value(forHTTPHeaderField: "ETag")
+                ?? fallbackResponse?.value(forHTTPHeaderField: "ETag")
+            throw WolinError.notModified(etag: etag)
         }
         try validateSuccessStatus(response: response, data: data, requestURL: url)
-        return buildPodResource(url: url, response: response, data: data)
+        return buildPodResource(url: url, response: response, data: data, fallbackResponse: fallbackResponse)
     }
 
     /// Retrieves Solid Pod LDP resource metadata and `ETag` via `HEAD` without downloading the body.
@@ -210,19 +310,20 @@ public actor WolinClient {
         at url: URL,
         etagMatch: ETagMatch = .any
     ) async throws -> PodResource {
-        let (data, response) = try await performRequest(
+        let (data, response, fallbackResponse) = try await performSafeReadRequest(
             method: "HEAD",
             url: url,
             headers: [:],
-            body: nil,
             etagMatch: etagMatch,
             attachAuth: true
         )
         if response.statusCode == 304 {
-            throw WolinError.notModified(etag: response.value(forHTTPHeaderField: "ETag"))
+            let etag = response.value(forHTTPHeaderField: "ETag")
+                ?? fallbackResponse?.value(forHTTPHeaderField: "ETag")
+            throw WolinError.notModified(etag: etag)
         }
         try validateSuccessStatus(response: response, data: data, requestURL: url)
-        return buildPodResource(url: url, response: response, data: Data())
+        return buildPodResource(url: url, response: response, data: Data(), fallbackResponse: fallbackResponse)
     }
 
     /// Creates or replaces a Solid Pod LDP resource via `PUT` with optional `If-Match` / `If-None-Match` ETag preconditions.
@@ -364,7 +465,80 @@ public actor WolinClient {
         return try WebIdParser.extractContainedURLs(turtle, containerURL: containerURL)
     }
 
-    // MARK: - Internal Transport & DPoP Proof Attachment
+    // MARK: - Internal Transport, Safe Redirects & DPoP Proof Attachment
+
+    private func performSafeReadRequest(
+        method: String,
+        url: URL,
+        headers: [String: String],
+        etagMatch: ETagMatch,
+        attachAuth: Bool
+    ) async throws -> (Data, HTTPURLResponse, HTTPURLResponse?) {
+        var (data, response) = try await performRequest(
+            method: method,
+            url: url,
+            headers: headers,
+            body: nil,
+            etagMatch: etagMatch,
+            attachAuth: attachAuth
+        )
+
+        guard Self.redirectStatusCodes.contains(response.statusCode) else {
+            return (data, response, nil)
+        }
+
+        let podRedirectResponse = response
+        let initialOrigin = originKey(for: url)
+        var currentURL = url
+
+        for _ in 0..<Self.maxSafeRedirects {
+            guard let rawLocation = response.value(forHTTPHeaderField: "Location")?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !rawLocation.isEmpty else {
+                return (data, response, podRedirectResponse)
+            }
+
+            let nextURL = try resolveSafeRedirectURL(rawLocation, baseURL: currentURL)
+            let sameOrigin = originKey(for: nextURL) == initialOrigin
+
+            var redirectHeaders: [String: String] = [:]
+            if let accept = headers["Accept"] {
+                redirectHeaders["Accept"] = accept
+            }
+
+            (data, response) = try await performRequest(
+                method: method,
+                url: nextURL,
+                headers: redirectHeaders,
+                body: nil,
+                etagMatch: .any,
+                attachAuth: attachAuth && sameOrigin
+            )
+            currentURL = nextURL
+
+            if !Self.redirectStatusCodes.contains(response.statusCode) {
+                return (data, response, podRedirectResponse)
+            }
+        }
+
+        throw WolinError.transportError(
+            "Exceeded maximum redirect hops (\(Self.maxSafeRedirects)) while reading '\(url.absoluteString)'"
+        )
+    }
+
+    private func resolveSafeRedirectURL(_ rawLocation: String, baseURL: URL) throws -> URL {
+        let resolvedString = try WebIdParser.resolveIRI(rawLocation, base: baseURL.absoluteString)
+        guard let targetURL = URL(string: resolvedString),
+              let comps = URLComponents(url: targetURL, resolvingAgainstBaseURL: true),
+              let scheme = comps.scheme?.lowercased(),
+              (scheme == "http" || scheme == "https"),
+              comps.user == nil,
+              comps.password == nil,
+              comps.host != nil else {
+            throw WolinError.invalidURL(rawLocation)
+        }
+        return targetURL
+    }
 
     private func performRequest(
         method: String,
@@ -442,7 +616,10 @@ public actor WolinClient {
         let data: Data
         let urlResponse: URLResponse
         do {
-            (data, urlResponse) = try await session.data(for: request)
+            (data, urlResponse) = try await session.data(
+                for: request,
+                delegate: NoRedirectSessionDelegate.shared
+            )
         } catch {
             throw WolinError.transportError(error.localizedDescription)
         }
@@ -492,12 +669,17 @@ public actor WolinClient {
     private func buildPodResource(
         url: URL,
         response: HTTPURLResponse,
-        data: Data
+        data: Data,
+        fallbackResponse: HTTPURLResponse? = nil
     ) -> PodResource {
         let contentType = response.value(forHTTPHeaderField: "Content-Type")
         let etag = response.value(forHTTPHeaderField: "ETag")
+            ?? fallbackResponse?.value(forHTTPHeaderField: "ETag")
         let wacAllow = response.value(forHTTPHeaderField: "WAC-Allow")
-        let linkHeader = response.value(forHTTPHeaderField: "Link") ?? ""
+            ?? fallbackResponse?.value(forHTTPHeaderField: "WAC-Allow")
+        let linkHeader = response.value(forHTTPHeaderField: "Link")
+            ?? fallbackResponse?.value(forHTTPHeaderField: "Link")
+            ?? ""
         let relations = LinkRelation.parseAll(linkHeader)
 
         var typeIRIs = Set<String>()
@@ -538,6 +720,13 @@ public actor WolinClient {
         }
 
         var normalizedHeaders: [String: String] = [:]
+        if let fallbackResponse {
+            for fallbackKey in ["Link", "WAC-Allow", "ETag"] {
+                if let fallbackVal = fallbackResponse.value(forHTTPHeaderField: fallbackKey) {
+                    normalizedHeaders[fallbackKey] = fallbackVal
+                }
+            }
+        }
         for (rawKey, rawValue) in response.allHeaderFields {
             if let k = rawKey as? String, let v = rawValue as? String {
                 normalizedHeaders[k] = v
@@ -584,7 +773,10 @@ public actor WolinClient {
             return url.host ?? url.absoluteString
         }
         if let port = components.port {
-            return "\(scheme)://\(host):\(port)"
+            let isDefault = (scheme == "http" && port == 80) || (scheme == "https" && port == 443)
+            if !isDefault {
+                return "\(scheme)://\(host):\(port)"
+            }
         }
         return "\(scheme)://\(host)"
     }

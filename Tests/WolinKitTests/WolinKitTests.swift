@@ -322,6 +322,106 @@ final class WolinKitTests: XCTestCase {
         XCTAssertEqual(attemptCounter.value, 10)
     }
 
+    // MARK: - 5. pod_id Validation & Safe 302 Signed-Asset Offload Redirects
+
+    func testPodIDValidationAndProductionEndpoints() throws {
+        XCTAssertEqual(WolinClient.defaultAuthURLString, "https://auth.wolin.id")
+        XCTAssertEqual(WolinClient.defaultPodURLString, "https://pod.wolin.id")
+        XCTAssertEqual(WolinClient.defaultAuthURL.absoluteString, "https://auth.wolin.id")
+        XCTAssertEqual(WolinClient.defaultPodURL.absoluteString, "https://pod.wolin.id")
+
+        let validHandles = ["bob", "alice", "alice-01", String(repeating: "a", count: 32), "team-alpha-2026"]
+        for valid in validHandles {
+            XCTAssertTrue(WolinClient.isValidPodID(valid), valid)
+            XCTAssertEqual(try WolinClient.validatePodID(valid), valid)
+        }
+
+        let invalidHandles = [
+            "", "a", "ab", String(repeating: "a", count: 33), "Alice", "-alice", "alice-",
+            "alice--dev", "xn--p1ai", "alice_01", "alice.dev",
+            "auth", "pod", "pods", "api", "admin", "wolin", "www"
+        ]
+        for invalid in invalidHandles {
+            XCTAssertFalse(WolinClient.isValidPodID(invalid), invalid)
+            XCTAssertThrowsError(try WolinClient.validatePodID(invalid)) { error in
+                guard case WolinError.invalidPodID = error else {
+                    return XCTFail("Expected invalidPodID for '\(invalid)', got \(error)")
+                }
+            }
+        }
+    }
+
+    func testSignedAsset302RedirectStripsAuthorizationAndDPoPHeaders() async throws {
+        let podHost = "offload-pod.wolin.test"
+        let cdnHost = "offload-cdn.wolin.test"
+        let expectedToken = "oidc-dpop-asset-token"
+        let assetBytes = Data("wolin-signed-r2-asset-payload".utf8)
+        let cdnHitCounter = AtomicCounter()
+
+        MockSolidRouter.shared.register(host: podHost) { req, _ in
+            guard let url = req.url else {
+                throw WolinError.invalidURL("Missing Pod URL")
+            }
+            guard req.value(forHTTPHeaderField: "Authorization") == "DPoP \(expectedToken)",
+                  let dpop = req.value(forHTTPHeaderField: "DPoP") else {
+                let resp = HTTPURLResponse(url: url, statusCode: 401, httpVersion: "HTTP/1.1", headerFields: nil)!
+                return (resp, Data("Unauthorized".utf8))
+            }
+            let claims = try TestDPoPVerifier.extractVerifiedClaims(jwt: dpop)
+            XCTAssertEqual(claims.htm, "GET")
+            XCTAssertEqual(claims.htu, "https://\(podHost)/pods/alice/media/avatar.png")
+
+            let headers = [
+                "Location": "https://\(cdnHost)/assets/alice/media/avatar.png?exp=1763500060&sig=ok",
+                "ETag": "\"asset-etag-v1\"",
+                "Link": "<\(SolidVocabulary.ldpNonRDFSource)>; rel=\"type\", <https://\(podHost)/pods/alice/media/avatar.png.acl>; rel=\"acl\"",
+                "WAC-Allow": "user=\"read write control\",public=\"\"",
+                "Cache-Control": "private, no-store"
+            ]
+            let resp = HTTPURLResponse(url: url, statusCode: 302, httpVersion: "HTTP/1.1", headerFields: headers)!
+            return (resp, Data())
+        }
+
+        MockSolidRouter.shared.register(host: cdnHost) { req, _ in
+            guard let url = req.url else {
+                throw WolinError.invalidURL("Missing CDN URL")
+            }
+            _ = cdnHitCounter.increment()
+            if req.value(forHTTPHeaderField: "Authorization") != nil || req.value(forHTTPHeaderField: "DPoP") != nil {
+                let leak = HTTPURLResponse(url: url, statusCode: 400, httpVersion: "HTTP/1.1", headerFields: nil)!
+                return (leak, Data("Credential leak detected on external signed asset CDN".utf8))
+            }
+            let ok = HTTPURLResponse(
+                url: url,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: ["Content-Type": "image/png"]
+            )!
+            return (ok, assetBytes)
+        }
+
+        defer {
+            MockSolidRouter.shared.unregister(host: podHost)
+            MockSolidRouter.shared.unregister(host: cdnHost)
+        }
+
+        let client = WolinClient(
+            accessToken: expectedToken,
+            webID: "https://\(podHost)/pods/alice/profile/card#me",
+            session: makeMockSession()
+        )
+
+        let assetURL = try XCTUnwrap(URL(string: "https://\(podHost)/pods/alice/media/avatar.png"))
+        let resource = try await client.getResource(at: assetURL, accept: "image/png")
+        XCTAssertEqual(resource.statusCode, 200)
+        XCTAssertEqual(resource.data, assetBytes)
+        XCTAssertEqual(resource.contentType, "image/png")
+        XCTAssertEqual(resource.etag, "\"asset-etag-v1\"")
+        XCTAssertEqual(resource.kind, .nonRdfSource)
+        XCTAssertEqual(resource.aclURL?.absoluteString, "https://\(podHost)/pods/alice/media/avatar.png.acl")
+        XCTAssertEqual(cdnHitCounter.value, 1)
+    }
+
     // MARK: - Test Helpers
 
     private func makeMockSession() -> URLSession {
