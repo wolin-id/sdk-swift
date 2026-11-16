@@ -1,6 +1,6 @@
 // swift-tools-version: 6.0
 // SPDX-License-Identifier: MIT OR Apache-2.0
-// Copyright (c) 2026 Entropy Paradox, Inc. (https://wolin.id)
+// Copyright (c) 2026 Entropy Paradox, Inc. — Wolin (月印千江) (https://wolin.id)
 
 import PackageDescription
 

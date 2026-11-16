@@ -1,11 +1,11 @@
-# WolinKit — Official Wolin Swift SDK
+# WolinKit — Official Wolin (月印千江) Swift SDK
 
 [![Swift CI](https://github.com/wolin-id/sdk-swift/actions/workflows/ci.yml/badge.svg)](https://github.com/wolin-id/sdk-swift/actions/workflows/ci.yml)
 [![Swift 6.0](https://img.shields.io/badge/Swift-6.0-F05138.svg)](https://swift.org)
 [![Platforms](https://img.shields.io/badge/Platforms-iOS%2016%2B%20%7C%20macOS%2013%2B%20%7C%20visionOS%201%2B-blue.svg)](https://developer.apple.com)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-lightgrey.svg)](#license)
 
-**WolinKit** (`wolin-id/sdk-swift`) is the official zero-dependency Swift Package Manager SDK for the **[Wolin Solid Pod Engine](https://wolin.id)** and W3C Solid 0.11 servers.
+**WolinKit** (`wolin-id/sdk-swift`) is the official zero-dependency Swift Package Manager SDK for **[Wolin (月印千江)](https://wolin.id)** and W3C Solid 0.11 servers.
 
 Built natively for **Swift 6.0 strict concurrency** using Apple `CryptoKit` and `URLSession`, `WolinKit` provides actor-isolated **Solid-OIDC + RFC 9449 DPoP** authentication, **WebID Turtle** profile parsing, `pim:storage` discovery, and optimistic-concurrency **Solid LDP CRUD** with `ETag` preconditions.
 
@@ -23,8 +23,21 @@ Built natively for **Swift 6.0 strict concurrency** using Apple `CryptoKit` and 
 - **Solid LDP CRUD with ETag Preconditions**:
   - `GET`, `HEAD`, `PUT`, `POST`, `PATCH` (`application/sparql-update`), and `DELETE` over `URLSession`.
   - First-class `ETagMatch` (`If-Match`, `If-None-Match`, `.createOnly` / `If-None-Match: *`) optimistic concurrency control.
+- **Safe Signed-Asset Offload Redirects (`302 Found`)**:
+  - Intercepts `URLSession` HTTP redirects per-task and follows short-lived HMAC-signed Edge/R2/CDN redirects on `GET` / `HEAD` **without** leaking `Authorization` or `DPoP` headers across origins.
+- **`pod_id` Handle Validation**:
+  - Built-in `WolinClient.isValidPodID(_:)` and `WolinClient.validatePodID(_:)` (`3..32` chars, lowercase `[a-z0-9-]`, starts/ends with `[a-z0-9]`, no `--`, reserved-handle blocklist).
 - **Swift 6.0 Actor Safety & Zero Third-Party Dependencies**:
   - `public actor WolinClient` and `Sendable` value types across **iOS 16+**, **macOS 13+**, and **visionOS 1+**.
+
+---
+
+## Official Production Endpoints
+
+| Service | Endpoint | Constant |
+| :--- | :--- | :--- |
+| Solid-OIDC Provider & Passport | `https://auth.wolin.id` | `WolinClient.defaultAuthURL` |
+| Sovereign Solid Pod Engine | `https://pod.wolin.id` | `WolinClient.defaultPodURL` |
 
 ---
 
@@ -55,6 +68,9 @@ import Foundation
 import CryptoKit
 import WolinKit
 
+// Validate Pod handle format (3..32 chars, lowercase [a-z0-9-], no '--')
+try WolinClient.validatePodID("alice")
+
 // 1. Initialize DPoPSigner (or supply an existing P256.Signing.PrivateKey bound to your OIDC token)
 let privateKey = P256.Signing.PrivateKey()
 let signer = DPoPSigner(privateKey: privateKey)
@@ -67,7 +83,9 @@ let client = WolinClient(
     dpopSigner: signer
 )
 
-// 3. Dereference WebID Profile & discover pim:storage
+// 3. Dereference WebID Profile, verify Solid-OIDC issuer (https://auth.wolin.id), & discover pim:storage
+let profile = try await client.fetchWebIDProfile()
+precondition(profile.authorizes(oidcIssuer: WolinClient.defaultAuthURLString))
 let storageURL = try await client.discoverStorage()
 
 // 4. Create a Turtle RDF resource with If-None-Match: * (.createOnly)
@@ -98,6 +116,22 @@ if let etag = latest.etag {
 }
 ```
 
+## `pod_id` Format Rules
+
+Wolin Pod handles (`{pod_id}.wolin.id` and `https://pod.wolin.id/pods/{pod_id}/`) enforce strict DNS-label & anti-spoofing rules:
+
+- Length: `3..32` characters
+- Characters: lowercase ASCII `[a-z0-9-]`, starting and ending with `[a-z0-9]`
+- No consecutive hyphens (`--`)
+- Reserved system/infrastructure handles (e.g., `auth`, `pod`, `pods`, `api`, `admin`, `wolin`, `www`) are rejected
+
+```swift
+WolinClient.isValidPodID("alice-01")   // true
+WolinClient.isValidPodID("ab")         // false (< 3 chars)
+WolinClient.isValidPodID("alice--dev") // false (consecutive '--')
+WolinClient.isValidPodID("auth")       // false (reserved handle)
+```
+
 ---
 
 ## Package Layout
@@ -107,13 +141,13 @@ sdk-swift/
 ├── Package.swift
 ├── Sources/
 │   └── WolinKit/
-│       ├── WolinClient.swift    # Actor-safe Solid-OIDC + DPoP & LDP CRUD client
+│       ├── WolinClient.swift    # Actor-safe Solid-OIDC + DPoP, safe 302 redirects & LDP CRUD client
 │       ├── DPoPSigner.swift     # CryptoKit P-256 ES256 DPoP JWT, RFC 7638 jkt & ath
 │       ├── WebIdParser.swift    # Pure-Swift W3C Turtle WebID & ldp:contains parser
 │       └── PodResource.swift    # PodResource, ETagMatch, LinkRelation & WolinError
 └── Tests/
     └── WolinKitTests/
-        └── WolinKitTests.swift  # Cryptography, Turtle & mock Solid Pod E2E tests
+        └── WolinKitTests.swift  # Cryptography, Turtle, pod_id, 302 asset offload & E2E tests
 ```
 
 ---

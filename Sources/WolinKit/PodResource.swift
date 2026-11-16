@@ -262,6 +262,7 @@ public struct PodWriteResult: Sendable, Equatable {
 /// Typed errors emitted by `WolinKit`.
 public enum WolinError: Error, LocalizedError, Sendable, Equatable {
     case invalidURL(String)
+    case invalidPodID(String)
     case invalidDPoPTarget(String)
     case cryptographyError(String)
     case invalidWebIDProfile(String)
@@ -279,6 +280,8 @@ public enum WolinError: Error, LocalizedError, Sendable, Equatable {
         switch self {
         case .invalidURL(let raw):
             return "Invalid URL: \(raw)"
+        case .invalidPodID(let reason):
+            return "Invalid Wolin pod_id: \(reason)"
         case .invalidDPoPTarget(let reason):
             return "Invalid RFC 9449 DPoP target: \(reason)"
         case .cryptographyError(let reason):
